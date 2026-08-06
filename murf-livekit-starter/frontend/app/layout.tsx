@@ -71,33 +71,25 @@ export default async function RootLayout({ children }: RootLayoutProps) {
           enableSystem
           disableTransitionOnChange
         >
-          <header className="fixed top-0 left-0 z-50 hidden w-full flex-row justify-between p-6 md:flex">
-            <a
-              target="_blank"
-              rel="noopener noreferrer"
-              href="https://livekit.io"
-              className="scale-100 transition-transform duration-300 hover:scale-110"
-            >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={logo} alt={`${companyName} Logo`} className="block size-6 dark:hidden" />
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={logoDark ?? logo}
-                alt={`${companyName} Logo`}
-                className="hidden size-6 dark:block"
-              />
-            </a>
-            <span className="text-foreground font-mono text-xs font-bold tracking-wider uppercase">
-              Built with{' '}
+          <header className="fixed top-0 left-0 z-50 hidden w-full flex-row justify-between items-center p-5 md:flex">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-border/50 bg-background/70 backdrop-blur-sm">
+              <span className="text-base">🏥</span>
+              <span className="font-bold text-foreground text-sm">Aarogya</span>
+              <span className="text-xs text-muted-foreground">· Health Access AI</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="text-foreground font-mono text-xs font-bold tracking-wider uppercase px-3 py-1.5 rounded-full border border-border/50 bg-background/70 backdrop-blur-sm">
+                #VoiceForBharat
+              </span>
               <a
                 target="_blank"
                 rel="noopener noreferrer"
-                href="https://docs.livekit.io/agents"
-                className="underline underline-offset-4"
+                href="https://murf.ai/api"
+                className="text-foreground font-mono text-xs font-bold tracking-wider uppercase px-3 py-1.5 rounded-full border border-border/50 bg-background/70 backdrop-blur-sm hover:bg-background transition-colors underline underline-offset-4"
               >
-                LiveKit Agents
+                Murf Falcon
               </a>
-            </span>
+            </div>
           </header>
 
           {children}
