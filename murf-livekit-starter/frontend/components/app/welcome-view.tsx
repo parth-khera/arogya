@@ -1,6 +1,8 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+'use client';
+
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { motion, AnimatePresence, useMotionValue, useSpring } from 'motion/react';
 
 const SAMPLE_PROMPTS = [
@@ -86,13 +88,16 @@ export const WelcomeView = ({
     return () => window.removeEventListener('mousemove', handleMouseMove);
   }, [mouseX, mouseY]);
 
-  const particles = Array.from({ length: 12 }, (_, i) => ({
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  const particles = useMemo(() => Array.from({ length: 12 }, () => ({
     x: Math.random() * 100,
     y: Math.random() * 100,
     size: Math.random() * 6 + 3,
     duration: Math.random() * 3 + 2,
     delay: Math.random() * 4,
-  }));
+  })), []);
 
   return (
     <div ref={ref} className="relative w-full min-h-screen overflow-hidden flex items-center justify-center">
@@ -118,9 +123,9 @@ export const WelcomeView = ({
         transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut' }}
       />
 
-      {/* Floating particles */}
+      {/* Floating particles — client only to avoid hydration mismatch */}
       <div className="absolute inset-0 pointer-events-none overflow-hidden" ref={containerRef}>
-        {particles.map((p, i) => <Particle key={i} {...p} />)}
+        {mounted && particles.map((p, i) => <Particle key={i} {...p} />)}
       </div>
 
       {/* Grid pattern overlay */}
