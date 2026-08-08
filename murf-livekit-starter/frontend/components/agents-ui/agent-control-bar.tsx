@@ -266,7 +266,12 @@ export function AgentControlBar({
   } = useInputControls({ onDeviceError, saveUserChoices });
 
   const handleSendMessage = async (message: string) => {
-    await send(message);
+    if (!send) return;
+    try {
+      await send(message);
+    } catch (error) {
+      console.warn('Chat send failed:', error);
+    }
   };
 
   const visibleControls = {
