@@ -83,6 +83,7 @@ function AgentStatusBadge({ state }: { state: string | undefined }) {
 }
 
 export interface AgentSessionView_01Props {
+  onCallEnd?: () => void;
   preConnectMessage?: string;
   supportsChatInput?: boolean;
   supportsVideoInput?: boolean;
@@ -115,6 +116,7 @@ export function AgentSessionView_01({
   audioVisualizerRadialBarCount,
   audioVisualizerRadialRadius,
   audioVisualizerWaveLineWidth,
+  onCallEnd,
   ref,
   className,
   ...props
@@ -245,7 +247,7 @@ export function AgentSessionView_01({
               controls={controls}
               isChatOpen={chatOpen}
               isConnected={session.isConnected}
-              onDisconnect={session.end}
+              onDisconnect={onCallEnd ?? session.end}
               onIsChatOpenChange={setChatOpen}
             />
           </div>
