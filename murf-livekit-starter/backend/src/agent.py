@@ -277,6 +277,8 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=True,
     )
 
+    await ctx.connect()
+
     await session.start(
         agent=Assistant(session, user_id),
         room=ctx.room,
@@ -291,8 +293,6 @@ async def my_agent(ctx: JobContext):
             ),
         ),
     )
-
-    await ctx.connect()
 
 
 if __name__ == "__main__":
