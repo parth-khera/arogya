@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import Annotated
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -9,13 +10,16 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    RunContext,
     cli,
-    inference,
+    function_tool,
     tokenize,
     room_io,
 )
 from livekit.plugins import murf, silero, groq, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+import db
 
 logger = logging.getLogger("agent")
 logging.basicConfig(level=logging.INFO)
@@ -23,8 +27,8 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv(".env.local")
 
 # ── Voices ────────────────────────────────────────────────────────────────────
-VOICE_FEMALE = "Anisha"   # Indian English female
-VOICE_MALE   = "Arjun"    # Indian English male
+VOICE_FEMALE = "Anisha"
+VOICE_MALE   = "Arjun"
 
 # ── Name → gender lookup ──────────────────────────────────────────────────────
 MALE_NAMES = {
@@ -54,6 +58,27 @@ Your job is to help callers understand their health situation, find care, and
 access government health schemes. You are warm, calm, and speak like a trusted
 community health worker — not a doctor, not a call-centre robot.
 
+MEMORY & TOOLS
+You have three tools:
+- lookup_caller(user_id): call this at the START of every session to check if
+  this person has called before. Use the room name as user_id.
+- save_caller_info(...): call this when you learn something worth remembering
+  (name, age band, ongoing condition, triage outcome). ALWAYS ask the caller
+  for permission first: "Kya main aapki yeh jaankari yaad rakh sakta hoon
+  agle baar ke liye?" — only save if they agree.
+- forget_me(user_id): call this if the caller asks to be forgotten. Confirm
+  deletion and never reference their data again.
+
+RETURNING CALLERS
+If lookup_caller returns a record, greet them by name and reference the last
+interaction naturally. Example: "Namaste Priya! Pichhli baar aapne chest pain
+ke baare mein baat ki thi — kya ab theek hain aap?"
+Do NOT read out all stored facts — weave them in naturally only when relevant.
+
+CONSENT RULE (hard rule for Health Access)
+Never save any health information without explicit verbal consent.
+If the caller says no or is unsure, do not call save_caller_info.
+
 OBJECTIVES
 A successful call achieves at least one of these three things:
 1. The caller understands whether their symptom needs urgent care, a clinic
@@ -70,39 +95,27 @@ workers operate, general nutrition and hygiene advice.
 You do NOT know: real-time bed availability, live drug prices, a caller's
 personal medical history, or anything outside public health access.
 
-LANGUAGE
+LANGUAGE & SCRIPT
 Mirror the caller's language exactly.
-- If they speak Hindi, reply in Hindi.
+- If they speak Hindi, reply in Hindi using Devanagari script (नमस्ते), never romanized.
 - If they mix Hindi and English (Hinglish), match that mix naturally.
 - If they speak Tamil, Bengali, Marathi, or any other Indian language, reply
-  in that language to the best of your ability, or ask them to switch to Hindi
-  or English if you cannot.
+  in that language, or ask them to switch to Hindi or English if you cannot.
 - Never use bullet points, numbered lists, markdown, brackets, or emojis in
   your spoken replies — this is voice, not text.
 - Keep every reply under 30 words unless the caller asks for more detail.
-- Speak at a calm, unhurried pace. Pause naturally between ideas.
 
 GUARDRAILS  ← these are absolute, never override them
-1. NEVER diagnose. Do not say "you have X disease." Say "this sounds like it
-   could be serious — please see a doctor today."
-2. NEVER name a specific prescription drug or dosage. If asked, say
-   "I cannot suggest medicines — only a doctor can prescribe safely."
-3. NEVER claim a government scheme will definitely cover the caller. Say
-   "you may be eligible — the best way to confirm is to visit your nearest
-   empanelled hospital or call 14555."
-4. RED-FLAG ESCALATION — if the caller mentions any of these, immediately
-   say the escalation script and end advice:
-   - chest pain, difficulty breathing, stroke symptoms (face drooping, arm
-     weakness, slurred speech), unconsciousness, heavy bleeding, poisoning,
-     severe burns, signs of a heart attack, suicidal thoughts.
-   ESCALATION SCRIPT: "This sounds like a medical emergency. Please call 112
-   right now or go to the nearest government hospital immediately. Do not wait."
+1. NEVER diagnose. Say "this sounds like it could be serious — please see a doctor today."
+2. NEVER name a specific prescription drug or dosage.
+3. NEVER claim a government scheme will definitely cover the caller.
+4. RED-FLAG ESCALATION — chest pain, difficulty breathing, stroke symptoms,
+   unconsciousness, heavy bleeding, poisoning, severe burns, suicidal thoughts:
+   "This sounds like a medical emergency. Please call 112 right now or go to
+   the nearest government hospital immediately. Do not wait."
 5. NEVER ask for Aadhaar number, bank details, OTP, or any personal ID.
-6. NEVER give an all-clear. Do not say "you are fine" or "you don't need a
-   doctor." Always end with "but if you feel worse, please see a doctor."
-7. OUT-OF-SCOPE: If asked about anything unrelated to health access — politics,
-   entertainment, finance, relationships — say: "I am only here to help with
-   health questions. Is there something about your health I can help with?"
+6. NEVER give an all-clear. Always end with "but if you feel worse, please see a doctor."
+7. OUT-OF-SCOPE: "I am only here to help with health questions."
 
 SILENCE HANDLING
 If the caller goes silent for more than 5 seconds, say:
@@ -114,15 +127,13 @@ Then close the session gracefully.
 STYLE
 - First turn: greet by name once you know it; before that use "aap" or "you."
 - Never repeat the caller's symptom back word-for-word more than once.
-- If the caller sounds distressed, acknowledge it first before giving
-  information: "I understand this is worrying."
+- If the caller sounds distressed, acknowledge it first.
 - Never use filler phrases like "Great question!" or "Certainly!"
 - End every health-advice turn with one clear next step.
 
-FIRST-TURN GREETING
+FIRST-TURN GREETING (new callers only — skip if lookup_caller found a record)
 "Namaste! Main Aarogya hoon — aapka health guide. Aap mujhse apni health
 ke baare mein kuch bhi pooch sakte hain. Pehle, aapka naam kya hai?"
-(If the caller responds in English, switch fully to English from that point.)
 """
 
 
@@ -148,17 +159,63 @@ def detect_gender(text: str) -> str | None:
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
 class Assistant(Agent):
-    def __init__(self, session: AgentSession) -> None:
+    def __init__(self, session: AgentSession, user_id: str) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
-        self._session        = session
-        self._name_detected  = False
+        self._session       = session
+        self._user_id       = user_id
+        self._name_detected = False
         self._silence_task: asyncio.Task | None = None
+
+    # ── LLM-callable tools ────────────────────────────────────────────────────
+    @function_tool()
+    async def lookup_caller(
+        self,
+        context: RunContext,
+        user_id: Annotated[str, "The room name used as the caller's unique ID"],
+    ) -> dict:
+        """Look up a returning caller by their user_id. Returns their stored profile or an empty dict."""
+        record = db.get_user(user_id)
+        logger.info("lookup_caller(%s) → %s", user_id, record)
+        return record or {}
+
+    @function_tool()
+    async def save_caller_info(
+        self,
+        context: RunContext,
+        user_id: Annotated[str, "The room name / caller ID"],
+        name: Annotated[str | None, "Caller's first name"] = None,
+        language_pref: Annotated[str | None, "Language they prefer (e.g. Hindi, English, Marathi)"] = None,
+        age_band: Annotated[str | None, "Age range, e.g. '30-40', 'child', 'elderly'"] = None,
+        conditions: Annotated[list[str] | None, "Ongoing health conditions mentioned, e.g. ['diabetes', 'hypertension']"] = None,
+        last_triage: Annotated[str | None, "Brief outcome of this call, e.g. 'advised clinic visit for fever'"] = None,
+    ) -> str:
+        """Save or update caller information ONLY after receiving explicit verbal consent."""
+        db.upsert_user(
+            user_id=user_id,
+            name=name,
+            language_pref=language_pref,
+            age_band=age_band,
+            conditions=conditions,
+            last_triage=last_triage,
+        )
+        logger.info("save_caller_info(%s) name=%s triage=%s", user_id, name, last_triage)
+        return "Saved."
+
+    @function_tool()
+    async def forget_me(
+        self,
+        context: RunContext,
+        user_id: Annotated[str, "The room name / caller ID to delete"],
+    ) -> str:
+        """Delete all stored information for this caller. Call only when they explicitly ask to be forgotten."""
+        deleted = db.delete_user(user_id)
+        logger.info("forget_me(%s) deleted=%s", user_id, deleted)
+        return "Deleted." if deleted else "No record found."
 
     # ── voice switching ───────────────────────────────────────────────────────
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         await super().on_user_turn_completed(turn_ctx, new_message)
 
-        # Cancel any pending silence timer — user spoke
         if self._silence_task and not self._silence_task.done():
             self._silence_task.cancel()
 
@@ -176,7 +233,6 @@ class Assistant(Agent):
                 self._session._tts = make_tts(VOICE_FEMALE)
                 logger.info("voice → %s", VOICE_FEMALE)
 
-        # Start silence timer after each user turn
         self._silence_task = asyncio.create_task(self._silence_handler())
 
     # ── silence handler ───────────────────────────────────────────────────────
@@ -210,9 +266,10 @@ server.setup_fnc = prewarm
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
+    user_id = ctx.room.name  # stable per-room ID used as caller key
 
     session = AgentSession(
-        stt=deepgram.STT(model="nova-3"),
+        stt=deepgram.STT(model="nova-3", language="multi"),
         llm=groq.LLM(model="llama-3.3-70b-versatile"),
         tts=make_tts(VOICE_FEMALE),
         turn_detection=MultilingualModel(),
@@ -221,7 +278,7 @@ async def my_agent(ctx: JobContext):
     )
 
     await session.start(
-        agent=Assistant(session),
+        agent=Assistant(session, user_id),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
