@@ -59,21 +59,13 @@ access government health schemes. You are warm, calm, and speak like a trusted
 community health worker — not a doctor, not a call-centre robot.
 
 MEMORY & TOOLS
-You have three tools:
-- lookup_caller(user_id): call this at the START of every session to check if
-  this person has called before. Use the room name as user_id.
+You have two tools:
 - save_caller_info(...): call this when you learn something worth remembering
   (name, age band, ongoing condition, triage outcome). ALWAYS ask the caller
   for permission first: "Kya main aapki yeh jaankari yaad rakh sakta hoon
   agle baar ke liye?" — only save if they agree.
 - forget_me(user_id): call this if the caller asks to be forgotten. Confirm
   deletion and never reference their data again.
-
-RETURNING CALLERS
-If lookup_caller returns a record, greet them by name and reference the last
-interaction naturally. Example: "Namaste Priya! Pichhli baar aapne chest pain
-ke baare mein baat ki thi — kya ab theek hain aap?"
-Do NOT read out all stored facts — weave them in naturally only when relevant.
 
 CONSENT RULE (hard rule for Health Access)
 Never save any health information without explicit verbal consent.
@@ -131,7 +123,11 @@ STYLE
 - Never use filler phrases like "Great question!" or "Certainly!"
 - End every health-advice turn with one clear next step.
 
-FIRST-TURN GREETING (new callers only — skip if lookup_caller found a record)
+FIRST-TURN GREETING
+If the CALLER PROFILE block above shows a returning caller, greet them by name
+and reference their last interaction naturally. Example:
+"Namaste Priya! Pichhli baar aapne chest pain ke baare mein baat ki thi — kya ab theek hain?"
+If CALLER PROFILE shows "New caller", use this greeting:
 "Namaste! Main Aarogya hoon — aapka health guide. Aap mujhse apni health
 ke baare mein kuch bhi pooch sakte hain. Pehle, aapka naam kya hai?"
 """
@@ -157,27 +153,44 @@ def detect_gender(text: str) -> str | None:
     return None
 
 
+def build_instructions(user_id: str) -> str:
+    """Build system prompt with caller profile injected at the top."""
+    record = db.get_user(user_id)
+    if record:
+        conditions = record.get("conditions") or []
+        if isinstance(conditions, str):
+            import json
+            try:
+                conditions = json.loads(conditions)
+            except Exception:
+                conditions = [conditions]
+        profile = (
+            f"CALLER PROFILE (returning caller)\n"
+            f"Name: {record.get('name', 'unknown')}\n"
+            f"Language preference: {record.get('language_pref', 'unknown')}\n"
+            f"Age band: {record.get('age_band', 'unknown')}\n"
+            f"Known conditions: {', '.join(conditions) if conditions else 'none'}\n"
+            f"Last call summary: {record.get('last_triage', 'none')}\n"
+        )
+        logger.info("Returning caller loaded: %s", record.get("name"))
+    else:
+        profile = "CALLER PROFILE\nNew caller — no previous record.\n"
+        logger.info("New caller: %s", user_id)
+    return profile + "\n" + SYSTEM_PROMPT
+
+
 # ── Agent ─────────────────────────────────────────────────────────────────────
 class Assistant(Agent):
     def __init__(self, session: AgentSession, user_id: str) -> None:
-        super().__init__(instructions=SYSTEM_PROMPT)
+        super().__init__(instructions=build_instructions(user_id))
         self._session       = session
         self._user_id       = user_id
         self._name_detected = False
+        self._consent_given = False
+        self._pending_save: dict = {}
         self._silence_task: asyncio.Task | None = None
 
     # ── LLM-callable tools ────────────────────────────────────────────────────
-    @function_tool()
-    async def lookup_caller(
-        self,
-        context: RunContext,
-        user_id: Annotated[str, "The room name used as the caller's unique ID"],
-    ) -> dict:
-        """Look up a returning caller by their user_id. Returns their stored profile or an empty dict."""
-        record = db.get_user(user_id)
-        logger.info("lookup_caller(%s) → %s", user_id, record)
-        return record or {}
-
     @function_tool()
     async def save_caller_info(
         self,
@@ -198,6 +211,7 @@ class Assistant(Agent):
             conditions=conditions,
             last_triage=last_triage,
         )
+        self._consent_given = True
         logger.info("save_caller_info(%s) name=%s triage=%s", user_id, name, last_triage)
         return "Saved."
 
@@ -222,6 +236,19 @@ class Assistant(Agent):
         text = new_message.text_content or ""
         logger.info("user said: %r", text)
 
+        # Detect consent keywords and flush any pending save
+        consent_words = {"haan", "han", "yes", "sure", "okay", "ok", "bilkul", "zaroor"}
+        refusal_words = {"nahi", "nahin", "no", "nope", "mat", "band"}
+        words = set(text.lower().split())
+        if words & consent_words and self._pending_save:
+            self._consent_given = True
+            db.upsert_user(**self._pending_save)
+            logger.info("Consent received — saved: %s", self._pending_save)
+            self._pending_save = {}
+        elif words & refusal_words:
+            self._pending_save = {}
+            logger.info("Consent refused — discarding pending save")
+
         if not self._name_detected:
             gender = detect_gender(text)
             if gender == "male":
@@ -232,6 +259,17 @@ class Assistant(Agent):
                 self._name_detected = True
                 self._session._tts = make_tts(VOICE_FEMALE)
                 logger.info("voice → %s", VOICE_FEMALE)
+
+        # Stage name for saving (pending consent)
+        if not self._consent_given:
+            gender = detect_gender(text)
+            if gender:
+                for word in text.lower().split():
+                    clean = word.strip(".,!?")
+                    if clean in MALE_NAMES or clean in FEMALE_NAMES:
+                        self._pending_save["user_id"] = self._user_id
+                        self._pending_save["name"] = clean.capitalize()
+                        break
 
         self._silence_task = asyncio.create_task(self._silence_handler())
 
