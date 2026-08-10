@@ -133,7 +133,7 @@ async def triage_symptoms(symptoms: str) -> dict:
 # API endpoint returns PHC/CHC/district hospital records by state
 _DATAGOV_URL = (
     "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
-    "?api-key=579b464db66ec23bdd000001cdd3946e44ce4aab825d0fb0f3e3f462"
+    "?api-key=apikey"
     "&format=json&limit=5&filters[State_Name]={state}"
 )
 
