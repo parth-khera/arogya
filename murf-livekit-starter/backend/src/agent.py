@@ -20,6 +20,7 @@ from livekit.plugins import murf, silero, groq, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import db
+from tools import triage_symptoms, find_health_facility
 
 logger = logging.getLogger("agent")
 logging.basicConfig(level=logging.INFO)
@@ -59,13 +60,23 @@ access government health schemes. You are warm, calm, and speak like a trusted
 community health worker — not a doctor, not a call-centre robot.
 
 MEMORY & TOOLS
-You have two tools:
+You have four tools:
+- triage_symptoms(symptoms): call this EVERY TIME a caller describes any physical
+  symptom or health complaint. Speak the action naturally — never read JSON.
+  Always add: "but only a doctor can confirm this."
+- find_health_facility(state, city): call this when a caller asks where to go,
+  which hospital to visit, or how to find a clinic. Always say when the data is from.
+  If facilities list is empty, read out the fallback_message and helpline number.
 - save_caller_info(...): call this when you learn something worth remembering
   (name, age band, ongoing condition, triage outcome). ALWAYS ask the caller
   for permission first: "Kya main aapki yeh jaankari yaad rakh sakta hoon
   agle baar ke liye?" — only save if they agree.
 - forget_me(user_id): call this if the caller asks to be forgotten. Confirm
   deletion and never reference their data again.
+
+TOOL FAILURE RULE
+If any tool returns an error or empty data, say something useful out loud.
+Never go silent. Never invent data. Say when the information is from.
 
 CONSENT RULE (hard rule for Health Access)
 Never save any health information without explicit verbal consent.
@@ -191,6 +202,25 @@ class Assistant(Agent):
         self._silence_task: asyncio.Task | None = None
 
     # ── LLM-callable tools ────────────────────────────────────────────────────
+    @function_tool()
+    async def triage_symptoms(
+        self,
+        context: RunContext,
+        symptoms: Annotated[str, "The caller's symptom description in their own words"],
+    ) -> dict:
+        """Classify symptom urgency and get recommended action. Call this for ANY health complaint."""
+        return await triage_symptoms(symptoms)
+
+    @function_tool()
+    async def find_health_facility(
+        self,
+        context: RunContext,
+        state: Annotated[str, "Indian state name, e.g. 'Maharashtra', 'Delhi', 'Karnataka'"],
+        city: Annotated[str | None, "City or district name, optional"] = None,
+    ) -> dict:
+        """Find nearby government hospitals, PHCs, or CHCs for a given state/city in India."""
+        return await find_health_facility(state, city)
+
     @function_tool()
     async def save_caller_info(
         self,
