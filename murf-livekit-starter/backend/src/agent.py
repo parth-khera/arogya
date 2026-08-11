@@ -144,6 +144,37 @@ ke baare mein kuch bhi pooch sakte hain. Pehle, aapka naam kya hai?"
 """
 
 
+# ── Outbound system prompt ────────────────────────────────────────────────────
+OUTBOUND_SYSTEM_PROMPT = """\
+IDENTITY
+You are Aarogya, a health-access assistant. You are making an outbound follow-up
+call. The person did not initiate this call.
+
+OPENING — say this FIRST, before anything else:
+"Namaste, main Aarogya bol raha hoon — ek health assistant. Pichhli baar aapne
+hum se {triage} ke baare mein baat ki thi. Main sirf yeh jaanna chahta tha ki
+aap ab kaisa feel kar rahe hain. Agar aap baat nahi karna chahte, bas 'band karo'
+keh dijiye aur main call khatam kar dunga."
+
+RULES FOR OUTBOUND
+- Keep the call under 3 minutes.
+- If the person says stop, end, band karo, or hang up — say goodbye immediately
+  and end the session.
+- If they say they are fine — confirm, offer the helpline 1800-180-1104, say goodbye.
+- If they describe a new or worsening symptom — triage it using triage_symptoms.
+- Never ask for personal or financial information.
+- End every call with: "Dhyan rakhiye. Aarogya helpline 1800-180-1104 pe hamesha
+  available hai."
+
+TOOLS
+- triage_symptoms(symptoms): use if they describe any symptom.
+- find_health_facility(state, city): use if they ask where to go.
+
+GUARDRAILS
+Same as inbound: no diagnosis, no drug names, 112 for emergencies.
+"""
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def make_tts(voice: str) -> murf.TTS:
     return murf.TTS(
@@ -320,6 +351,35 @@ class Assistant(Agent):
             pass
 
 
+# ── Outbound agent ────────────────────────────────────────────────────────────
+class OutboundAssistant(Agent):
+    """Agent for outbound follow-up calls placed via SIP."""
+    def __init__(self, session: AgentSession, user_id: str, triage_summary: str) -> None:
+        prompt = OUTBOUND_SYSTEM_PROMPT.replace("{triage}", triage_summary)
+        super().__init__(instructions=prompt)
+        self._session = session
+        self._user_id = user_id
+
+    @function_tool()
+    async def triage_symptoms(
+        self,
+        context: RunContext,
+        symptoms: Annotated[str, "The caller's symptom description"],
+    ) -> dict:
+        """Classify symptom urgency. Call for any health complaint."""
+        return await triage_symptoms(symptoms)
+
+    @function_tool()
+    async def find_health_facility(
+        self,
+        context: RunContext,
+        state: Annotated[str, "Indian state name"],
+        city: Annotated[str | None, "City or district, optional"] = None,
+    ) -> dict:
+        """Find nearby government hospitals or PHCs."""
+        return await find_health_facility(state, city)
+
+
 # ── Server setup ──────────────────────────────────────────────────────────────
 server = AgentServer()
 
@@ -334,7 +394,7 @@ server.setup_fnc = prewarm
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
-    user_id = ctx.room.name  # stable per-room ID used as caller key
+    user_id = ctx.room.name
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="multi"),
@@ -349,6 +409,49 @@ async def my_agent(ctx: JobContext):
 
     await session.start(
         agent=Assistant(session, user_id),
+        room=ctx.room,
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                noise_cancellation=lambda params: (
+                    noise_cancellation.BVCTelephony()
+                    if params.participant.kind
+                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                    else noise_cancellation.BVC()
+                ),
+            ),
+        ),
+    )
+
+
+@server.rtc_session(agent_name="my-agent-outbound")
+async def outbound_followup(ctx: JobContext):
+    """Handles outbound follow-up calls dispatched via SIP."""
+    ctx.log_context_fields = {"room": ctx.room.name}
+
+    await ctx.connect()
+
+    # Parse metadata injected by outbound.py: "followup|<user_id>|<triage_summary>"
+    user_id = ctx.room.name
+    triage_summary = "aapki pichhli call"
+    for p in ctx.room.remote_participants.values():
+        meta = p.metadata or ""
+        if meta.startswith("followup|"):
+            parts = meta.split("|", 2)
+            if len(parts) == 3:
+                user_id, triage_summary = parts[1], parts[2]
+            break
+
+    session = AgentSession(
+        stt=deepgram.STT(model="nova-3", language="multi"),
+        llm=groq.LLM(model="llama-3.3-70b-versatile"),
+        tts=make_tts(VOICE_FEMALE),
+        turn_detection=MultilingualModel(),
+        vad=ctx.proc.userdata["vad"],
+        preemptive_generation=True,
+    )
+
+    await session.start(
+        agent=OutboundAssistant(session, user_id, triage_summary),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(

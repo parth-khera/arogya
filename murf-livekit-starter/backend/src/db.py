@@ -19,9 +19,22 @@ def _conn() -> sqlite3.Connection:
             age_band          TEXT,
             conditions        TEXT,
             last_triage       TEXT,
-            last_interaction  TEXT
+            last_interaction  TEXT,
+            phone             TEXT,
+            follow_up_needed  INTEGER DEFAULT 0,
+            followed_up_at    TEXT
         )
     """)
+    # migrate existing tables that predate these columns
+    for col, typedef in [
+        ("phone", "TEXT"),
+        ("follow_up_needed", "INTEGER DEFAULT 0"),
+        ("followed_up_at", "TEXT"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE callers ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass
     con.commit()
     return con
 
@@ -50,21 +63,30 @@ def upsert_user(
     age_band: str | None = None,
     conditions: list[str] | None = None,
     last_triage: str | None = None,
+    phone: str | None = None,
+    follow_up_needed: bool | None = None,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     existing = get_user(user_id) or {}
+    follow_up_val = (
+        int(follow_up_needed) if follow_up_needed is not None
+        else existing.get("follow_up_needed", 0)
+    )
     with _conn() as con:
         con.execute("""
             INSERT INTO callers
-                (user_id, name, language_pref, age_band, conditions, last_triage, last_interaction)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (user_id, name, language_pref, age_band, conditions, last_triage,
+                 last_interaction, phone, follow_up_needed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 name             = COALESCE(excluded.name,          callers.name),
                 language_pref    = COALESCE(excluded.language_pref, callers.language_pref),
                 age_band         = COALESCE(excluded.age_band,       callers.age_band),
                 conditions       = COALESCE(excluded.conditions,     callers.conditions),
                 last_triage      = COALESCE(excluded.last_triage,    callers.last_triage),
-                last_interaction = excluded.last_interaction
+                last_interaction = excluded.last_interaction,
+                phone            = COALESCE(excluded.phone,          callers.phone),
+                follow_up_needed = excluded.follow_up_needed
         """, (
             user_id,
             name or existing.get("name"),
@@ -76,7 +98,27 @@ def upsert_user(
             ),
             last_triage or existing.get("last_triage"),
             now,
+            phone or existing.get("phone"),
+            follow_up_val,
         ))
+
+
+def follow_up_due() -> list[dict]:
+    """Return callers who need a follow-up call and have a phone number."""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM callers WHERE follow_up_needed = 1 AND phone IS NOT NULL AND followed_up_at IS NULL"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_followed_up(user_id: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute(
+            "UPDATE callers SET followed_up_at = ?, follow_up_needed = 0 WHERE user_id = ?",
+            (now, user_id),
+        )
 
 
 def delete_user(user_id: str) -> bool:
