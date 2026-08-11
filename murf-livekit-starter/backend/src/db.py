@@ -104,10 +104,10 @@ def upsert_user(
 
 
 def follow_up_due() -> list[dict]:
-    """Return callers who need a follow-up call and have a phone number."""
+    """Return callers who need a follow-up call."""
     with _conn() as con:
         rows = con.execute(
-            "SELECT * FROM callers WHERE follow_up_needed = 1 AND phone IS NOT NULL AND followed_up_at IS NULL"
+            "SELECT * FROM callers WHERE follow_up_needed = 1 AND followed_up_at IS NULL"
         ).fetchall()
     return [dict(r) for r in rows]
 
