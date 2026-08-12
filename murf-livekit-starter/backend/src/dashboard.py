@@ -1,5 +1,5 @@
 """
-Aarogya escalation dashboard — minimal FastAPI app.
+Aarogya escalation dashboard — FastAPI app.
 
 Run:
     uv run python src/dashboard.py
@@ -15,8 +15,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env.local")
 
 import db
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 import uvicorn
 
 app = FastAPI(title="Aarogya Escalations")
@@ -30,7 +30,10 @@ _HTML = """<!DOCTYPE html>
 <style>
   body {{ font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 24px; }}
   h1 {{ color: #f97316; margin-bottom: 4px; }}
-  p.sub {{ color: #94a3b8; margin-top: 0; margin-bottom: 24px; }}
+  p.sub {{ color: #94a3b8; margin-top: 0; margin-bottom: 16px; }}
+  nav a {{ color: #f97316; text-decoration: none; margin-right: 16px; font-size: 14px; }}
+  nav a:hover {{ text-decoration: underline; }}
+  nav {{ margin-bottom: 24px; }}
   table {{ width: 100%; border-collapse: collapse; }}
   th {{ background: #1e293b; padding: 10px 14px; text-align: left; font-size: 12px;
         text-transform: uppercase; letter-spacing: .05em; color: #94a3b8; }}
@@ -44,11 +47,19 @@ _HTML = """<!DOCTYPE html>
   .low       {{ background: #14532d; color: #86efac; }}
   .ref {{ font-family: monospace; color: #f97316; }}
   .empty {{ text-align: center; padding: 48px; color: #475569; }}
+  button {{ background: #166534; color: #86efac; border: none; padding: 4px 12px;
+             border-radius: 6px; cursor: pointer; font-size: 12px; }}
+  button:hover {{ background: #15803d; }}
 </style>
 </head>
 <body>
-<h1>🏥 Aarogya — Open Escalations</h1>
-<p class="sub">Refresh to update &nbsp;·&nbsp; {count} open request(s)</p>
+<h1>🏥 Aarogya — Escalations</h1>
+<p class="sub">{count} open · <a href="/resolved">view resolved</a></p>
+<nav>
+  <a href="/">Open</a>
+  <a href="/resolved">Resolved</a>
+  <a href="/api/escalations">JSON API</a>
+</nav>
 {table}
 </body>
 </html>"""
@@ -58,39 +69,80 @@ _ROW = """<tr>
   <td>{caller_name}</td>
   <td><span class="badge {urgency_cls}">{urgency}</span></td>
   <td>{reason}</td>
-  <td style="max-width:320px">{summary}</td>
+  <td style="max-width:240px">{summary}</td>
+  <td style="color:#94a3b8;font-size:12px">{language}</td>
+  <td style="color:#94a3b8;font-size:12px;max-width:160px">{agent_checked}</td>
   <td style="color:#94a3b8;font-size:12px">{created_at}</td>
+  <td>{action}</td>
 </tr>"""
 
+_THEAD = """<table>
+<thead><tr>
+  <th>Ref ID</th><th>Caller</th><th>Urgency</th>
+  <th>Reason</th><th>Summary</th><th>Language</th>
+  <th>Agent Checked</th><th>Created</th><th></th>
+</tr></thead>
+<tbody>{rows}</tbody>
+</table>"""
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    rows = db.list_escalations("open")
-    if not rows:
-        table = '<p class="empty">No open escalations 🎉</p>'
-    else:
-        trs = "".join(_ROW.format(
+_RESOLVE_BTN = """<form method="post" action="/resolve/{ref_id}">
+  <button type="submit">✓ Resolve</button>
+</form>"""
+
+
+def _render_rows(rows: list[dict], show_resolve: bool) -> str:
+    trs = []
+    for r in rows:
+        action = _RESOLVE_BTN.format(ref_id=r["ref_id"]) if show_resolve else "—"
+        trs.append(_ROW.format(
             ref_id=r["ref_id"],
             caller_name=r["caller_name"] or "—",
             urgency=r["urgency"].upper(),
             urgency_cls=r["urgency"].lower(),
             reason=r["reason"].replace("_", " ").title(),
-            summary=r["summary"][:200],
-            created_at=r["created_at"][:19].replace("T", " "),
-        ) for r in rows)
-        table = f"""<table>
-<thead><tr>
-  <th>Ref ID</th><th>Caller</th><th>Urgency</th>
-  <th>Reason</th><th>Summary</th><th>Created</th>
-</tr></thead>
-<tbody>{trs}</tbody>
-</table>"""
+            summary=(r["summary"] or "")[:200],
+            language=r.get("language") or "—",
+            agent_checked=(r.get("agent_checked") or "—")[:80],
+            created_at=(r["created_at"] or "")[:19].replace("T", " "),
+            action=action,
+        ))
+    return _THEAD.format(rows="".join(trs))
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    rows = db.list_escalations("open")
+    table = _render_rows(rows, show_resolve=True) if rows else '<p class="empty">No open escalations 🎉</p>'
     return _HTML.format(count=len(rows), table=table)
+
+
+@app.get("/resolved", response_class=HTMLResponse)
+def resolved():
+    rows = db.list_escalations("resolved")
+    table = _render_rows(rows, show_resolve=False) if rows else '<p class="empty">No resolved escalations yet.</p>'
+    return _HTML.format(count=0, table=table).replace(
+        f"{0} open", f"{len(rows)} resolved"
+    )
+
+
+@app.post("/resolve/{ref_id}")
+def resolve(ref_id: str):
+    db.update_escalation_status(ref_id, "resolved")
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/api/escalations")
 def api_escalations(status: str = "open"):
     return db.list_escalations(status)
+
+
+@app.get("/api/escalations/{ref_id}")
+def api_escalation_detail(ref_id: str):
+    esc = db.get_escalation(ref_id)
+    if not esc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Not found")
+    return esc
 
 
 if __name__ == "__main__":

@@ -156,6 +156,24 @@ def list_escalations(status: str = "open") -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def update_escalation_status(ref_id: str, status: str) -> bool:
+    """Update escalation status (e.g. 'open' → 'resolved'). Returns True if found."""
+    with _conn() as con:
+        cur = con.execute(
+            "UPDATE escalations SET status=? WHERE ref_id=?",
+            (status, ref_id),
+        )
+    return cur.rowcount > 0
+
+
+def get_escalation(ref_id: str) -> dict | None:
+    with _conn() as con:
+        row = con.execute(
+            "SELECT * FROM escalations WHERE ref_id=?", (ref_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def follow_up_due() -> list[dict]:
     """Return callers who need a follow-up call."""
     with _conn() as con:
