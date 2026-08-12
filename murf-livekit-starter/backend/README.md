@@ -1,14 +1,14 @@
-# Backend — Voice Agent with Murf Falcon TTS
+# Backend — Aarogya Voice Health Agent
 
-The Python backend for the Voice Agent Starter. It runs a real-time voice AI pipeline using [LiveKit Agents](https://docs.livekit.io/agents), connecting Murf Falcon TTS, Deepgram STT, and Google Gemini into a single conversational agent.
+The Python backend for Aarogya. Runs a real-time voice AI pipeline using [LiveKit Agents](https://docs.livekit.io/agents), connecting Murf Falcon TTS, Deepgram STT, and Groq LLaMA into a conversational health access agent for India.
 
 ## How It Works
 
 ```
-User speaks → [Deepgram STT] → text → [Gemini LLM] → response → [Murf Falcon TTS] → audio → User hears
+User speaks → [Deepgram STT] → text → [Groq LLaMA 3.3 70B] → response → [Murf Falcon TTS] → audio → User hears
 ```
 
-LiveKit handles the real-time audio transport. The agent connects to LiveKit as a participant, listens for user speech, and responds with synthesized audio.
+LiveKit handles real-time audio transport. On red-flag symptoms or diagnosis requests, the agent asks for consent and creates a human escalation record visible at `http://localhost:8080`.
 
 ## Setup
 
@@ -16,7 +16,9 @@ LiveKit handles the real-time audio transport. The agent connects to LiveKit as 
 
 ```bash
 cd backend
+uv venv --python 3.11
 uv sync
+uv run python src/agent.py download-files
 ```
 
 ### 2. Configure environment
@@ -25,168 +27,100 @@ uv sync
 cp .env.example .env.local
 ```
 
-Fill in your keys in `.env.local`:
+Fill in `.env.local`:
 
-| Variable             | Where to get it                                           |
-| -------------------- | --------------------------------------------------------- |
-| `LIVEKIT_URL`        | [LiveKit Cloud](https://cloud.livekit.io/) → Settings     |
-| `LIVEKIT_API_KEY`    | [LiveKit Cloud](https://cloud.livekit.io/) → Settings     |
-| `LIVEKIT_API_SECRET` | [LiveKit Cloud](https://cloud.livekit.io/) → Settings     |
-| `MURF_API_KEY`       | [murf.ai/api/dashboard](https://murf.ai/api/dashboard)    |
-| `DEEPGRAM_API_KEY`   | [deepgram.com](https://console.deepgram.com/)             |
-| `GOOGLE_API_KEY`     | [aistudio.google.com](https://aistudio.google.com/apikey) |
+| Variable | Where to get it |
+|---|---|
+| `LIVEKIT_URL` | [cloud.livekit.io](https://cloud.livekit.io) → Settings |
+| `LIVEKIT_API_KEY` | [cloud.livekit.io](https://cloud.livekit.io) → Settings |
+| `LIVEKIT_API_SECRET` | [cloud.livekit.io](https://cloud.livekit.io) → Settings |
+| `MURF_API_KEY` | [murf.ai/api/dashboard](https://murf.ai/api/dashboard) |
+| `DEEPGRAM_API_KEY` | [console.deepgram.com](https://console.deepgram.com) |
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) |
+| `DISCORD_WEBHOOK_URL` | Optional — Discord channel → Integrations → Webhooks |
 
-For LiveKit Cloud users, you can auto-populate LiveKit credentials:
-
-```bash
-lk cloud auth
-lk app env -w -d .env.local
-```
-
-### 3. Download models
+### 3. Run
 
 ```bash
-uv run python src/agent.py download-files
-```
-
-This downloads Silero VAD and the LiveKit turn detector models.
-
-### 4. Run the agent
-
-```bash
-# Development mode (auto-reload)
+# Agent (development, auto-reload)
 uv run python src/agent.py dev
 
-# Or test directly in your terminal (no frontend needed)
+# Escalation dashboard (health worker view)
+uv run python src/dashboard.py
+# Open http://localhost:8080
+
+# Console mode (no frontend needed)
 uv run python src/agent.py console
-
-# Production
-uv run python src/agent.py start
 ```
 
-## Configuration
-
-All configuration lives in [`src/agent.py`](src/agent.py).
-
-### System prompt
-
-The `SYSTEM_PROMPT` constant at the top of `agent.py` controls what your agent does. Change it to build any voice-powered use case.
-
-#### Example prompts
-
-**Customer Support (default):**
+## Project Structure
 
 ```
-You are a friendly and efficient customer support agent for a tech company. Help users with account issues, billing questions, and product troubleshooting. Be concise, empathetic, and solution-oriented. If you don't know something, say so honestly and offer to escalate.
+backend/
+├── src/
+│   ├── agent.py        # Agent pipeline, voice switching, all LLM-callable tools
+│   ├── tools.py        # triage_symptoms(), find_health_facility()
+│   ├── db.py           # SQLite: callers table + escalations table
+│   ├── escalation.py   # Discord webhook for escalation notifications
+│   ├── dashboard.py    # FastAPI dashboard — view/resolve escalations (port 8080)
+│   └── outbound.py     # Outbound follow-up call dispatcher
+├── data/               # SQLite DB (gitignored — contains caller data)
+├── tests/
+│   └── test_agent.py   # LLM-judged eval suite
+├── .env.example
+├── pyproject.toml
+└── Dockerfile
 ```
 
-**Language Tutor:**
+## Tools
 
-```
-You are a patient and encouraging language tutor helping the user practice conversational Spanish. Speak primarily in Spanish but switch to English to explain grammar or vocabulary when needed. Correct mistakes gently and suggest better phrasing. Keep conversations natural and fun.
-```
+| Tool | Trigger | What it does |
+|---|---|---|
+| `triage_symptoms` | Any health complaint | Classifies RED / YELLOW / GREEN, returns spoken action |
+| `find_health_facility` | "Where to go" questions | Queries data.gov.in live API, falls back to local index |
+| `create_escalation` | RED triage or diagnosis request | Saves escalation to DB, fires Discord webhook, returns ref ID |
+| `save_caller_info` | Name / condition learned | Persists caller profile to SQLite (consent required) |
+| `forget_me` | Caller asks to be forgotten | Deletes all stored data for that caller |
 
-**AI Receptionist:**
+## Escalation Flow
 
-```
-You are a professional receptionist for a medical clinic. Help callers schedule appointments, answer questions about office hours and services, and take messages for doctors. Be warm but efficient. Ask for the caller's name and reason for calling upfront.
-```
+1. Agent detects red-flag symptom or diagnosis request
+2. Asks caller for consent before sharing any information
+3. If consent given — calls `create_escalation()` with: caller name, reason, summary, urgency, language, what the agent already checked
+4. Record saved to `data/aarogya.db` (escalations table)
+5. Discord embed sent (colour-coded by urgency) if `DISCORD_WEBHOOK_URL` is set
+6. Caller receives reference ID — e.g. `ESC-3F9A2C`
+7. Health worker opens `http://localhost:8080`, reviews the request, clicks Resolve
 
-**Interview Coach:**
+Duplicate open escalations for the same caller + reason are suppressed — the existing ref ID is returned instead.
 
-```
-You are an experienced interview coach. Conduct mock interviews with the user for software engineering roles. Ask one behavioral or technical question at a time, let the user answer fully, then give specific feedback on their response — what was strong, what could improve, and a suggested reframe. Keep the tone encouraging but honest.
-```
-
-**Sales Assistant:**
-
-```
-You are a knowledgeable sales assistant for an electronics store. Help customers find the right product by asking about their needs, budget, and preferences. Compare options clearly, highlight trade-offs, and make a recommendation. Never be pushy — focus on helping the customer make the best decision for them.
-```
-
-**Fitness Coach:**
-
-```
-You are an upbeat personal fitness coach. Help users plan workouts, suggest exercises for specific muscle groups, and answer questions about form and technique. Ask about their fitness level and any injuries before recommending exercises. Keep instructions clear and motivating.
-```
-
-**Storyteller / Bedtime Narrator:**
-
-```
-You are a creative storyteller who tells original bedtime stories for children aged 4–8. Ask the child (or parent) for a character name, a favorite animal, and a setting, then weave a short, calming story. Use vivid but simple language. End each story on a peaceful, sleepy note.
-```
-
-**Meeting Summarizer:**
-
-```
-You are a meeting assistant. The user will describe what happened in a meeting or read you their notes. Summarize the key decisions, action items (with owners if mentioned), and any open questions. Be concise and structured. Ask clarifying questions if something is ambiguous.
-```
-
-**Trivia Game Host:**
-
-```
-You are an enthusiastic trivia game host. Ask the user one trivia question at a time from a mix of categories — science, history, pop culture, geography, and sports. Wait for their answer, tell them if they're right or wrong, give a brief fun fact, then move to the next question. Keep score and announce it every 5 questions.
-```
-
-**Mental Health Check-in Companion:**
-
-```
-You are a gentle, non-clinical wellness companion. Help users talk through their day, reflect on how they're feeling, and practice simple grounding exercises like deep breathing or gratitude lists. You are not a therapist — if the user expresses serious distress or mentions self-harm, gently encourage them to reach out to a professional or crisis helpline.
-```
-
-### Voice
-
-Set the `voice` argument in the `murf.TTS(...)` call:
+## Voice Configuration
 
 ```python
-tts=murf.TTS(
-    voice="en-US-matthew",    # Change this
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True
-)
+VOICE_FEMALE = "Anisha"   # Indian English, female
+VOICE_MALE   = "Arjun"    # Indian English, male
 ```
 
-Some voice options:
+Gender is detected from the caller's name. Voice switches automatically mid-session.  
+Browse all voices: [Murf Voice Library](https://murf.ai/api/docs/voices-styles/voice-library).
 
-| Voice ID | Description                      |
-| -------- | -------------------------------- |
-| `Anisha` | Indian English, female (default) |
-| `Pooja`  | Indian English, female           |
-| `Samar`  | Indian English, male             |
-| `Amara`  | US English, female               |
-| `Hazel`  | UK English, female               |
-| `Bertie` | UK English, male                 |
-| `Gordon` | US English, male                 |
+## Dashboard API
 
-Browse all 150+ voices: [Murf Voice Library](https://murf.ai/api/docs/voices-styles/voice-library).
-
-### STT (Speech-to-Text)
-
-Default is Deepgram Nova-3. Change in the `AgentSession(stt=...)` call:
-
-```python
-stt=deepgram.STT(model="nova-3")
-```
-
-### LLM
-
-Default is Google Gemini. To switch:
-
-- **Gemini (default):** Set `GOOGLE_API_KEY` in `.env.local`
-- **OpenAI:** Set `OPENAI_API_KEY`, install `livekit-agents[openai]`, and change the `llm=` argument
+| Endpoint | Method | Description |
+|---|---|---|
+| `/` | GET | Open escalations (HTML) |
+| `/resolved` | GET | Resolved escalations (HTML) |
+| `/resolve/{ref_id}` | POST | Mark an escalation as resolved |
+| `/api/escalations` | GET | All escalations as JSON (`?status=open\|resolved`) |
+| `/api/escalations/{ref_id}` | GET | Single escalation detail as JSON |
 
 ## Testing
-
-The project includes an eval suite based on the LiveKit Agents [testing framework](https://docs.livekit.io/agents/build/testing/):
 
 ```bash
 uv run pytest
 ```
 
-Tests are in [`tests/test_agent.py`](tests/test_agent.py) and use LLM-as-judge evaluations to verify the agent behaves correctly (friendly greetings, grounding, refusing harmful requests).
-
-To run tests in CI, you'll need to add `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` as repository secrets.
+Tests use LLM-as-judge evaluations to verify agent behaviour. Requires `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` as environment variables (or repo secrets for CI).
 
 ## Deployment
 
@@ -195,33 +129,15 @@ To run tests in CI, you'll need to add `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LI
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/tIVCF1?referralCode=cNjn2P&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
 Set these environment variables in Railway:
-
-- `MURF_API_KEY`
-- `DEEPGRAM_API_KEY`
-- `GOOGLE_API_KEY`
+- `MURF_API_KEY`, `DEEPGRAM_API_KEY`, `GROQ_API_KEY`
 - `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+- `DISCORD_WEBHOOK_URL` (optional)
 
 ### Docker
 
-A production-ready [Dockerfile](Dockerfile) is included:
-
 ```bash
-docker build -t murf-voice-agent .
-docker run --env-file .env.local murf-voice-agent
-```
-
-## Project Structure
-
-```
-backend/
-├── src/
-│   └── agent.py          # Agent entrypoint — pipeline, prompt, config
-├── tests/
-│   └── test_agent.py     # LLM-judged eval suite
-├── .env.example           # Environment variable template
-├── pyproject.toml         # Python dependencies (uv)
-├── Dockerfile             # Production container
-└── railway.toml           # Railway deploy config
+docker build -t aarogya-backend .
+docker run --env-file .env.local aarogya-backend
 ```
 
 ## Links
@@ -230,6 +146,7 @@ backend/
 - [Murf Voice Library](https://murf.ai/api/docs/voices-styles/voice-library)
 - [LiveKit Agents Docs](https://docs.livekit.io/agents)
 - [Deepgram Nova-3 Docs](https://developers.deepgram.com)
+- [Groq Console](https://console.groq.com)
 
 ## License
 

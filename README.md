@@ -31,9 +31,12 @@ Aarogya solves this with a **voice-first** health access assistant — no readin
 | 🎙️ Voice-first | Speak naturally, get spoken responses |
 | 🇮🇳 Indian voice | Powered by Murf Falcon — Anisha (female) & Arjun (male) |
 | 🧠 Gender-adaptive | Detects user's name and switches to matching Indian voice |
-| 💊 Symptom guidance | Helps users understand symptoms and next steps |
+| 💊 Symptom triage | Classifies symptoms as RED / YELLOW / GREEN with next steps |
 | 🏛️ Scheme awareness | Explains Ayushman Bharat and other govt health schemes |
-| 🏥 Clinic finder | Guides users to find nearby healthcare facilities |
+| 🏥 Clinic finder | Finds nearby government hospitals, PHCs, and CHCs |
+| 🧠 Caller memory | Remembers returning callers (with consent) across sessions |
+| 🚨 Human escalation | Escalates red-flag symptoms to a health worker with consent |
+| 📋 Escalation dashboard | Health workers see open requests and resolve them at `/` |
 | ⚡ Ultra-low latency | Murf Falcon: 55ms model latency, 130ms time-to-first-audio |
 
 ---
@@ -52,7 +55,47 @@ Aarogya solves this with a **voice-first** health access assistant — no readin
                         │
                         ▼
                   🔊 User hears
+
+Escalation path (red-flag symptoms or diagnosis request):
+  Agent asks consent → create_escalation() → SQLite DB + Discord webhook
+                                                    │
+                                                    ▼
+                                         Health worker dashboard
+                                         http://localhost:8080
 ```
+
+---
+
+## 🚨 Human Escalation (Day 7)
+
+Aarogya knows when it cannot help alone. It escalates to a human health worker when:
+
+1. **Red-flag symptom** — triage returns RED (chest pain, stroke, breathing difficulty, heavy bleeding, poisoning, severe burns, suicidal thoughts)
+2. **Diagnosis request** — caller explicitly asks for a diagnosis or demands a medical opinion
+
+### How it works
+
+1. Agent detects the trigger and asks for consent in Hindi/English:  
+   *"Kya main aapki yeh jaankari ek health worker ko bhej sakta hoon jo aapko callback kar sake?"*
+2. If the caller agrees, `create_escalation()` is called — never without consent
+3. A record is saved to SQLite with: caller name, reason, summary, urgency level, language, and what the agent already checked
+4. A colour-coded Discord notification is sent (if `DISCORD_WEBHOOK_URL` is set)
+5. The caller receives a reference ID:  
+   *"Aapka reference number hai ESC-XXXXXX. Ek health worker 24 ghante mein aapko contact karenge."*
+6. Health workers open `http://localhost:8080` to see open requests and mark them resolved
+
+### Urgency levels
+
+| Level | Colour | Examples |
+|---|---|---|
+| 🔴 Emergency | Red | Chest pain, stroke, unconscious |
+| 🟠 High | Orange | Breathing difficulty, heavy bleeding |
+| 🟡 Medium | Yellow | Persistent fever, pregnancy concern |
+| 🟢 Low | Green | Diagnosis request, general concern |
+
+### Deduplication
+
+If the same caller already has an open escalation for the same reason, the existing reference ID is returned — no duplicate is created.
 
 ---
 
@@ -82,8 +125,6 @@ cd arogya/murf-livekit-starter
 
 ### 2. Set up environment variables
 
-Create `backend/.env.local` and `frontend/.env.local` from the examples:
-
 ```bash
 cp backend/.env.example backend/.env.local
 cp frontend/.env.example frontend/.env.local
@@ -99,6 +140,7 @@ Fill in these keys:
 | `MURF_API_KEY` | [murf.ai/api/dashboard](https://murf.ai/api/dashboard) |
 | `DEEPGRAM_API_KEY` | [deepgram.com](https://deepgram.com) |
 | `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) |
+| `DISCORD_WEBHOOK_URL` | Optional — Discord channel → Integrations → Webhooks |
 
 ### 3. Install dependencies
 
@@ -116,36 +158,45 @@ pnpm install
 
 ### 4. Run
 
-Open 2 terminals:
+Open 3 terminals:
 
 ```bash
 # Terminal 1 — Backend agent
 cd backend
 uv run python src/agent.py dev
 
-# Terminal 2 — Frontend
+# Terminal 2 — Escalation dashboard (health worker view)
+cd backend
+uv run python src/dashboard.py
+
+# Terminal 3 — Frontend
 cd frontend
 pnpm dev
 ```
 
-Open **http://localhost:3000**, click **Start talking**, and say:
-
-> *"Hi, I have a fever and headache. What should I do?"*
+- Voice agent: **http://localhost:3000**
+- Escalation dashboard: **http://localhost:8080**
 
 ---
 
 ## 🗣️ Try These Conversations
 
+**Normal call (no escalation):**
 ```
-"Hi, my name is Priya. I have been having chest pain since morning."
-
+"Hi, my name is Priya. I have a mild cold and runny nose."
 "What is Ayushman Bharat and am I eligible for it?"
-
 "My child has had a fever for 3 days. Should I go to the hospital?"
-
 "Where can I find a government hospital near me?"
-
 "I have diabetes. What foods should I avoid?"
+```
+
+**Escalation call (triggers human help):**
+```
+"Hi, my name is Rahul. I have chest pain and difficulty breathing since morning."
+→ Agent triages RED → asks consent → creates escalation → gives ref ID
+
+"Can you tell me exactly what disease I have?"
+→ Agent detects diagnosis request → asks consent → escalates
 ```
 
 ---
@@ -171,7 +222,13 @@ arogya/
 └── murf-livekit-starter/
     ├── backend/
     │   ├── src/
-    │   │   └── agent.py        # Agent logic, voice switching, system prompt
+    │   │   ├── agent.py        # Agent logic, voice switching, system prompt, tools
+    │   │   ├── tools.py        # triage_symptoms, find_health_facility
+    │   │   ├── db.py           # SQLite: callers, escalations (never committed)
+    │   │   ├── escalation.py   # Discord webhook notifications
+    │   │   ├── dashboard.py    # Health worker escalation dashboard (port 8080)
+    │   │   └── outbound.py     # Outbound follow-up call dispatcher
+    │   ├── data/               # SQLite DB lives here (gitignored)
     │   ├── .env.example
     │   └── pyproject.toml
     └── frontend/
@@ -192,7 +249,23 @@ arogya/
 | Brain (LLM) | [Groq](https://console.groq.com) LLaMA 3.3 70B |
 | Transport | [LiveKit](https://livekit.io) real-time audio |
 | Backend | Python 3.11, livekit-agents |
+| Database | SQLite (local, gitignored) |
+| Notifications | Discord webhooks |
 | Frontend | Next.js 15, TypeScript |
+
+---
+
+## 📅 Build Log — 10 Days of Voice Agents
+
+| Day | What was built |
+|---|---|
+| Day 1 | Basic voice agent with Murf Falcon TTS + Deepgram STT + Groq LLaMA |
+| Day 2 | Indian voice switching (Anisha / Arjun), gender detection from name |
+| Day 3 | System prompt — health triage, scheme awareness, guardrails |
+| Day 4 | Silence handling, Hinglish support, multilingual turn detection |
+| Day 5 | `triage_symptoms` tool (RED/YELLOW/GREEN), `find_health_facility` tool |
+| Day 6 | Caller memory with SQLite, consent gate, `save_caller_info`, `forget_me` |
+| Day 7 | Human escalation — `create_escalation`, consent flow, Discord webhook, dashboard |
 
 ---
 
