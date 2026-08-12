@@ -1,6 +1,7 @@
 """SQLite persistence for Aarogya caller memory."""
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,7 +26,20 @@ def _conn() -> sqlite3.Connection:
             followed_up_at    TEXT
         )
     """)
-    # migrate existing tables that predate these columns
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS escalations (
+            ref_id        TEXT PRIMARY KEY,
+            user_id       TEXT,
+            caller_name   TEXT,
+            reason        TEXT,
+            summary       TEXT,
+            urgency       TEXT,
+            language      TEXT,
+            agent_checked TEXT,
+            status        TEXT DEFAULT 'open',
+            created_at    TEXT
+        )
+    """)
     for col, typedef in [
         ("phone", "TEXT"),
         ("follow_up_needed", "INTEGER DEFAULT 0"),
@@ -101,6 +115,45 @@ def upsert_user(
             phone or existing.get("phone"),
             follow_up_val,
         ))
+
+
+def create_escalation(
+    user_id: str,
+    caller_name: str | None,
+    reason: str,
+    summary: str,
+    urgency: str,
+    language: str,
+    agent_checked: str,
+) -> str:
+    """Create a human-help escalation. Returns the ref_id."""
+    ref_id = "ESC-" + uuid.uuid4().hex[:6].upper()
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        # Avoid duplicate open escalations for same user+reason
+        existing = con.execute(
+            "SELECT ref_id FROM escalations WHERE user_id=? AND reason=? AND status='open'",
+            (user_id, reason),
+        ).fetchone()
+        if existing:
+            return existing["ref_id"]
+        con.execute("""
+            INSERT INTO escalations
+                (ref_id, user_id, caller_name, reason, summary, urgency,
+                 language, agent_checked, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        """, (ref_id, user_id, caller_name, reason, summary, urgency,
+               language, agent_checked, now))
+    return ref_id
+
+
+def list_escalations(status: str = "open") -> list[dict]:
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM escalations WHERE status=? ORDER BY created_at DESC",
+            (status,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def follow_up_due() -> list[dict]:

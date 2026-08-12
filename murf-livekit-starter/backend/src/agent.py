@@ -21,6 +21,7 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import db
 from tools import triage_symptoms, find_health_facility
+from escalation import send_escalation_webhook
 
 logger = logging.getLogger("agent")
 logging.basicConfig(level=logging.INFO)
@@ -60,19 +61,36 @@ access government health schemes. You are warm, calm, and speak like a trusted
 community health worker — not a doctor, not a call-centre robot.
 
 MEMORY & TOOLS
-You have four tools:
+You have five tools:
 - triage_symptoms(symptoms): call this EVERY TIME a caller describes any physical
   symptom or health complaint. Speak the action naturally — never read JSON.
   Always add: "but only a doctor can confirm this."
 - find_health_facility(state, city): call this when a caller asks where to go,
   which hospital to visit, or how to find a clinic. Always say when the data is from.
   If facilities list is empty, read out the fallback_message and helpline number.
+- create_escalation(...): call this when (1) triage returns RED urgency, or
+  (2) the caller explicitly asks for a diagnosis or demands a doctor's opinion.
+  ALWAYS ask permission first: "Kya main aapki yeh jaankari ek health worker
+  ko bhej sakta hoon jo aapko callback kar sake?" — only escalate if they agree.
+  After creating, give the caller their reference ID and say:
+  "Aapka reference number hai [REF_ID]. Ek health worker 24 ghante mein
+  aapko contact karenge."
 - save_caller_info(...): call this when you learn something worth remembering
   (name, age band, ongoing condition, triage outcome). ALWAYS ask the caller
   for permission first: "Kya main aapki yeh jaankari yaad rakh sakta hoon
   agle baar ke liye?" — only save if they agree.
 - forget_me(user_id): call this if the caller asks to be forgotten. Confirm
   deletion and never reference their data again.
+
+ESCALATION TRIGGERS (call create_escalation when either is true)
+1. RED urgency from triage_symptoms — chest pain, breathing difficulty, stroke,
+   unconsciousness, heavy bleeding, poisoning, burns, suicidal thoughts.
+2. Caller explicitly asks for a diagnosis, demands to know what disease they have,
+   or insists the agent give a medical opinion.
+
+ESCALATION CONSENT RULE
+Never create an escalation without explicit verbal consent.
+If the caller says no, do not call create_escalation.
 
 TOOL FAILURE RULE
 If any tool returns an error or empty data, say something useful out loud.
@@ -233,6 +251,32 @@ class Assistant(Agent):
         self._silence_task: asyncio.Task | None = None
 
     # ── LLM-callable tools ────────────────────────────────────────────────────
+    @function_tool()
+    async def create_escalation(
+        self,
+        context: RunContext,
+        reason: Annotated[str, "Why human help is needed: 'red_flag_symptom' or 'diagnosis_request'"],
+        summary: Annotated[str, "Brief summary for the health worker — no passwords or IDs"],
+        urgency: Annotated[str, "'emergency', 'high', 'medium', or 'low'"],
+        language: Annotated[str, "Language the caller used, e.g. 'Hindi', 'English', 'Hinglish'"],
+        agent_checked: Annotated[str, "What the agent already tried, e.g. 'triage_symptoms returned RED'"],
+        caller_name: Annotated[str | None, "Caller's first name if known"] = None,
+    ) -> dict:
+        """Create a human-help escalation ONLY after the caller gives explicit verbal consent."""
+        ref_id = db.create_escalation(
+            user_id=self._user_id,
+            caller_name=caller_name,
+            reason=reason,
+            summary=summary,
+            urgency=urgency,
+            language=language,
+            agent_checked=agent_checked,
+        )
+        logger.info("escalation created: %s urgency=%s", ref_id, urgency)
+        await send_escalation_webhook(ref_id, caller_name, reason, summary, urgency)
+        return {"ref_id": ref_id, "status": "open",
+                "next_step": "A health worker will contact you within 24 hours."}
+
     @function_tool()
     async def triage_symptoms(
         self,
