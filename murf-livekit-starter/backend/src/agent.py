@@ -473,52 +473,12 @@ server.setup_fnc = prewarm
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
-    user_id = ctx.room.name
-
-    session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language="multi"),
-        llm=groq.LLM(model="llama-3.3-70b-versatile"),
-        tts=make_tts(VOICE_FEMALE),
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True,
-    )
 
     await ctx.connect()
 
-    assistant = Assistant(session, user_id)
-    await session.start(
-        agent=assistant,
-        room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind
-                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
-                ),
-            ),
-        ),
-    )
-
-    # Wait for session to end, then record outcome
-    try:
-        await session.wait_for_disconnect()
-    finally:
-        assistant._record_call_end()
-
-
-@server.rtc_session(agent_name="my-agent-outbound")
-async def outbound_followup(ctx: JobContext):
-    """Handles outbound follow-up calls dispatched via SIP."""
-    ctx.log_context_fields = {"room": ctx.room.name}
-
-    await ctx.connect()
-
-    # Parse metadata injected by outbound.py: "followup|<user_id>|<triage_summary>"
+    # Detect outbound follow-up via participant metadata
     user_id = ctx.room.name
-    triage_summary = "aapki pichhli call"
+    triage_summary = None
     for p in ctx.room.remote_participants.values():
         meta = p.metadata or ""
         if meta.startswith("followup|"):
@@ -536,20 +496,35 @@ async def outbound_followup(ctx: JobContext):
         preemptive_generation=True,
     )
 
-    await session.start(
-        agent=OutboundAssistant(session, user_id, triage_summary),
-        room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind
-                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
-                ),
-            ),
-        ),
+    noise_fn = lambda params: (
+        noise_cancellation.BVCTelephony()
+        if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+        else noise_cancellation.BVC()
     )
+
+    if triage_summary is not None:
+        # Outbound follow-up call
+        await session.start(
+            agent=OutboundAssistant(session, user_id, triage_summary),
+            room=ctx.room,
+            room_options=room_io.RoomOptions(
+                audio_input=room_io.AudioInputOptions(noise_cancellation=noise_fn),
+            ),
+        )
+    else:
+        # Inbound call
+        assistant = Assistant(session, user_id)
+        await session.start(
+            agent=assistant,
+            room=ctx.room,
+            room_options=room_io.RoomOptions(
+                audio_input=room_io.AudioInputOptions(noise_cancellation=noise_fn),
+            ),
+        )
+        try:
+            await session.wait_for_disconnect()
+        finally:
+            assistant._record_call_end()
 
 
 if __name__ == "__main__":
