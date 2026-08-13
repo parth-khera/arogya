@@ -515,10 +515,6 @@ async def my_agent(ctx: JobContext):
         # Inbound call
         assistant = Assistant(session, user_id)
 
-        @session.on("close")
-        def _on_close(*_):
-            assistant._record_call_end()
-
         await session.start(
             agent=assistant,
             room=ctx.room,
@@ -527,7 +523,7 @@ async def my_agent(ctx: JobContext):
             ),
         )
 
-        await ctx.wait_for_disconnect()
+        session.on("close")(lambda e: assistant._record_call_end())
 
 
 if __name__ == "__main__":
