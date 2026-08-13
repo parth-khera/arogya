@@ -58,6 +58,7 @@ _HTML = """<!DOCTYPE html>
 <nav>
   <a href="/">Open</a>
   <a href="/resolved">Resolved</a>
+  <a href="/analytics">Analytics</a>
   <a href="/api/escalations">JSON API</a>
 </nav>
 {table}
@@ -143,6 +144,100 @@ def api_escalation_detail(ref_id: str):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Not found")
     return esc
+
+
+_ANALYTICS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>Aarogya — Analytics</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 24px; }}
+  h1 {{ color: #f97316; margin-bottom: 4px; }}
+  p.sub {{ color: #94a3b8; margin-top: 0; margin-bottom: 16px; }}
+  nav a {{ color: #f97316; text-decoration: none; margin-right: 16px; font-size: 14px; }}
+  nav {{ margin-bottom: 24px; }}
+  .cards {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 32px; }}
+  .card {{ background: #1e293b; border-radius: 12px; padding: 24px 32px; min-width: 160px; text-align: center; }}
+  .card .num {{ font-size: 48px; font-weight: 700; line-height: 1; }}
+  .card .lbl {{ font-size: 13px; color: #94a3b8; margin-top: 6px; text-transform: uppercase; letter-spacing: .05em; }}
+  .total   .num {{ color: #f97316; }}
+  .success .num {{ color: #86efac; }}
+  .failed  .num {{ color: #fca5a5; }}
+  .rate    .num {{ color: #93c5fd; font-size: 36px; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th {{ background: #1e293b; padding: 10px 14px; text-align: left; font-size: 12px;
+        text-transform: uppercase; letter-spacing: .05em; color: #94a3b8; }}
+  td {{ padding: 10px 14px; border-bottom: 1px solid #1e293b; font-size: 13px; }}
+  .ok  {{ color: #86efac; font-weight: 600; }}
+  .bad {{ color: #fca5a5; font-weight: 600; }}
+  .ft  {{ color: #94a3b8; font-size: 11px; }}
+</style>
+</head>
+<body>
+<h1>🏥 Aarogya — Call Analytics</h1>
+<p class="sub">Auto-refreshes every 15 seconds</p>
+<nav>
+  <a href="/analytics">Analytics</a>
+  <a href="/">Escalations</a>
+  <a href="/api/calls">JSON API</a>
+</nav>
+<div class="cards">
+  <div class="card total"><div class="num">{total}</div><div class="lbl">Total Calls</div></div>
+  <div class="card success"><div class="num">{successful}</div><div class="lbl">Successful</div></div>
+  <div class="card failed"><div class="num">{failed}</div><div class="lbl">Failed</div></div>
+  <div class="card rate"><div class="num">{rate}%</div><div class="lbl">Success Rate</div></div>
+</div>
+<h2 style="color:#94a3b8;font-size:14px;text-transform:uppercase;letter-spacing:.05em">Recent Calls</h2>
+{table}
+</body>
+</html>"""
+
+_CALL_ROW = """<tr>
+  <td style="font-family:monospace;font-size:11px;color:#64748b">{call_id}</td>
+  <td style="font-size:11px;color:#64748b">{started_at}</td>
+  <td>{duration_sec}s</td>
+  <td class="{outcome_cls}">{outcome}</td>
+  <td class="ft">{failure_type}</td>
+</tr>"""
+
+
+@app.get("/analytics", response_class=HTMLResponse)
+def analytics():
+    stats = db.get_call_stats()
+    total = stats["total"]
+    rate  = round(stats["successful"] / total * 100) if total else 0
+    rows  = "".join(
+        _CALL_ROW.format(
+            call_id=r["call_id"][:8] + "…",
+            started_at=(r["started_at"] or "")[:19].replace("T", " "),
+            duration_sec=r["duration_sec"] or 0,
+            outcome=r["outcome"].upper(),
+            outcome_cls="ok" if r["outcome"] == "success" else "bad",
+            failure_type=r.get("failure_type") or "—",
+        )
+        for r in stats["recent"]
+    )
+    table = (
+        "<table><thead><tr>"
+        "<th>Call ID</th><th>Started</th><th>Duration</th><th>Outcome</th><th>Failure Type</th>"
+        "</tr></thead><tbody>" + rows + "</tbody></table>"
+        if rows else "<p style='color:#475569'>No calls recorded yet.</p>"
+    )
+    return _ANALYTICS_HTML.format(
+        total=total,
+        successful=stats["successful"],
+        failed=stats["failed"],
+        rate=rate,
+        table=table,
+    )
+
+
+@app.get("/api/calls")
+def api_calls():
+    return db.get_call_stats()
 
 
 if __name__ == "__main__":

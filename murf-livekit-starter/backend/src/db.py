@@ -40,6 +40,17 @@ def _conn() -> sqlite3.Connection:
             created_at    TEXT
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS calls (
+            call_id      TEXT PRIMARY KEY,
+            user_id      TEXT,
+            started_at   TEXT,
+            ended_at     TEXT,
+            duration_sec INTEGER,
+            outcome      TEXT,
+            failure_type TEXT
+        )
+    """)
     for col, typedef in [
         ("phone", "TEXT"),
         ("follow_up_needed", "INTEGER DEFAULT 0"),
@@ -172,6 +183,46 @@ def get_escalation(ref_id: str) -> dict | None:
             "SELECT * FROM escalations WHERE ref_id=?", (ref_id,)
         ).fetchone()
     return dict(row) if row else None
+
+
+def record_call(
+    call_id: str,
+    user_id: str,
+    started_at: str,
+    ended_at: str,
+    duration_sec: int,
+    outcome: str,
+    failure_type: str | None = None,
+) -> None:
+    """Record a completed call. outcome: 'success' | 'failed'."""
+    with _conn() as con:
+        con.execute("""
+            INSERT OR REPLACE INTO calls
+                (call_id, user_id, started_at, ended_at, duration_sec, outcome, failure_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (call_id, user_id, started_at, ended_at, duration_sec, outcome, failure_type))
+
+
+def get_call_stats() -> dict:
+    """Return total, successful, failed counts and recent calls."""
+    with _conn() as con:
+        row = con.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(outcome = 'success') AS successful,
+                SUM(outcome = 'failed')  AS failed
+            FROM calls
+        """).fetchone()
+        recent = con.execute("""
+            SELECT call_id, user_id, started_at, ended_at, duration_sec, outcome, failure_type
+            FROM calls ORDER BY started_at DESC LIMIT 20
+        """).fetchall()
+    return {
+        "total":      row["total"]      or 0,
+        "successful": row["successful"] or 0,
+        "failed":     row["failed"]     or 0,
+        "recent":     [dict(r) for r in recent],
+    }
 
 
 def follow_up_due() -> list[dict]:

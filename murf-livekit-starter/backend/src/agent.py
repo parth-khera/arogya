@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import uuid
+from datetime import datetime, timezone
 from typing import Annotated
 
 from dotenv import load_dotenv
@@ -249,6 +251,13 @@ class Assistant(Agent):
         self._consent_given = False
         self._pending_save: dict = {}
         self._silence_task: asyncio.Task | None = None
+        self._call_id       = str(uuid.uuid4())
+        self._started_at    = datetime.now(timezone.utc).isoformat()
+        # success flags — any one being True = successful call
+        self._triage_given   = False
+        self._scheme_given   = False
+        self._facility_given = False
+        self._escalated      = False
 
     # ── LLM-callable tools ────────────────────────────────────────────────────
     @function_tool()
@@ -274,6 +283,7 @@ class Assistant(Agent):
         )
         logger.info("escalation created: %s urgency=%s", ref_id, urgency)
         await send_escalation_webhook(ref_id, caller_name, reason, summary, urgency)
+        self._escalated = True
         return {"ref_id": ref_id, "status": "open",
                 "next_step": "A health worker will contact you within 24 hours."}
 
@@ -284,7 +294,9 @@ class Assistant(Agent):
         symptoms: Annotated[str, "The caller's symptom description in their own words"],
     ) -> dict:
         """Classify symptom urgency and get recommended action. Call this for ANY health complaint."""
-        return await triage_symptoms(symptoms)
+        result = await triage_symptoms(symptoms)
+        self._triage_given = True
+        return result
 
     @function_tool()
     async def find_health_facility(
@@ -294,7 +306,9 @@ class Assistant(Agent):
         city: Annotated[str | None, "City or district name, optional"] = None,
     ) -> dict:
         """Find nearby government hospitals, PHCs, or CHCs for a given state/city in India."""
-        return await find_health_facility(state, city)
+        result = await find_health_facility(state, city)
+        self._facility_given = True
+        return result
 
     @function_tool()
     async def save_caller_info(
@@ -332,6 +346,26 @@ class Assistant(Agent):
         return "Deleted." if deleted else "No record found."
 
     # ── voice switching ───────────────────────────────────────────────────────
+    def _record_call_end(self, failure_type: str | None = None) -> None:
+        ended_at = datetime.now(timezone.utc).isoformat()
+        try:
+            start = datetime.fromisoformat(self._started_at)
+            end   = datetime.fromisoformat(ended_at)
+            duration = int((end - start).total_seconds())
+        except Exception:
+            duration = 0
+        success = self._triage_given or self._facility_given or self._escalated
+        db.record_call(
+            call_id=self._call_id,
+            user_id=self._user_id,
+            started_at=self._started_at,
+            ended_at=ended_at,
+            duration_sec=duration,
+            outcome="success" if success else "failed",
+            failure_type=None if success else (failure_type or "no_guidance_given"),
+        )
+        logger.info("call recorded: %s outcome=%s", self._call_id, "success" if success else "failed")
+
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         await super().on_user_turn_completed(turn_ctx, new_message)
 
@@ -391,6 +425,7 @@ class Assistant(Agent):
                 "Main yahan hoon jab bhi aapko zaroorat ho. Aap wapas call kar sakte hain. Take care!",
                 allow_interruptions=True,
             )
+            self._record_call_end(failure_type="user_silence_hangup")
         except asyncio.CancelledError:
             pass
 
@@ -451,8 +486,9 @@ async def my_agent(ctx: JobContext):
 
     await ctx.connect()
 
+    assistant = Assistant(session, user_id)
     await session.start(
-        agent=Assistant(session, user_id),
+        agent=assistant,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -465,6 +501,12 @@ async def my_agent(ctx: JobContext):
             ),
         ),
     )
+
+    # Wait for session to end, then record outcome
+    try:
+        await session.wait_for_disconnect()
+    finally:
+        assistant._record_call_end()
 
 
 @server.rtc_session(agent_name="my-agent-outbound")
