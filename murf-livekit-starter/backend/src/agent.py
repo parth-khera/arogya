@@ -515,6 +515,10 @@ async def my_agent(ctx: JobContext):
         # Inbound call
         assistant = Assistant(session, user_id)
 
+        @session.on("close")
+        def _on_close(e):
+            assistant._record_call_end()
+
         await session.start(
             agent=assistant,
             room=ctx.room,
@@ -522,8 +526,6 @@ async def my_agent(ctx: JobContext):
                 audio_input=room_io.AudioInputOptions(noise_cancellation=noise_fn),
             ),
         )
-
-        session.on("close")(lambda e: assistant._record_call_end())
 
 
 if __name__ == "__main__":
