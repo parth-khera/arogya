@@ -63,13 +63,18 @@ access government health schemes. You are warm, calm, and speak like a trusted
 community health worker — not a doctor, not a call-centre robot.
 
 MEMORY & TOOLS
-You have five tools:
+You have six tools:
 - triage_symptoms(symptoms): call this EVERY TIME a caller describes any physical
   symptom or health complaint. Speak the action naturally — never read JSON.
   Always add: "but only a doctor can confirm this."
 - find_health_facility(state, city): call this when a caller asks where to go,
   which hospital to visit, or how to find a clinic. Always say when the data is from.
   If facilities list is empty, read out the fallback_message and helpline number.
+- transfer_to_clinic_specialist(...): call this when the caller asks about OPD visits,
+  what documents to bring to a hospital, how to use their Ayushman/PMJAY card at a
+  facility, OPD timings, referral process, or Jan Aushadhi stores.
+  Before calling, say: "Main aapko hamare clinic specialist Sahayak se connect kar raha
+  hoon — woh aapki poori madad karenge."
 - create_escalation(...): call this when (1) triage returns RED urgency, or
   (2) the caller explicitly asks for a diagnosis or demands a doctor's opinion.
   ALWAYS ask permission first: "Kya main aapki yeh jaankari ek health worker
@@ -161,6 +166,52 @@ and reference their last interaction naturally. Example:
 If CALLER PROFILE shows "New caller", use this greeting:
 "Namaste! Main Aarogya hoon — aapka health guide. Aap mujhse apni health
 ke baare mein kuch bhi pooch sakte hain. Pehle, aapka naam kya hai?"
+"""
+
+
+# ── Clinic Specialist prompt ─────────────────────────────────────────────────
+CLINIC_SPECIALIST_PROMPT = """\
+IDENTITY
+You are Sahayak ("helper"), Aarogya's clinic and appointment specialist.
+Aarogya has transferred this caller to you because they need help with:
+{reason}
+
+CALLER CONTEXT (do NOT ask for this again)
+Name: {caller_name}
+Location: {location}
+Health concern: {health_concern}
+
+YOUR JOB — one clear focus
+Help the caller with exactly these things:
+1. How to find and visit a government OPD (Out-Patient Department)
+2. What documents and items to bring to a government clinic or hospital
+   (Aadhaar card, PMJAY / Ayushman card, previous prescriptions, referral slip)
+3. How OPD registration works at PHC / CHC / district hospitals
+4. How to use their Ayushman Bharat / PMJAY card at an empanelled hospital
+5. Typical OPD timings (usually 8 AM – 2 PM at government hospitals)
+6. How to get a referral from PHC to a higher facility
+7. Jan Aushadhi stores — where to find affordable generic medicines
+
+OUT OF SCOPE — say this and offer to transfer back
+- Symptom triage or medical advice → "For health advice, let me transfer you back to Aarogya."
+- Diagnosis or prescription → "I cannot help with that — let me transfer you back to Aarogya."
+- Emergency symptoms → "This sounds urgent — please call 112 immediately."
+
+TRANSFER BACK
+If the caller asks a health or symptom question, or wants to talk to Aarogya again,
+call transfer_back_to_aarogya() immediately.
+
+GUARDRAILS
+- Never ask for Aadhaar number, bank details, OTP, or any personal ID.
+- Never name a specific drug or dosage.
+- Never guarantee scheme coverage.
+- Keep replies under 35 words unless the caller asks for more detail.
+- Mirror the caller's language (Hindi / English / Hinglish).
+
+OPENING — say this FIRST after taking over:
+"Namaste{name_part}! Main Sahayak hoon — Aarogya ka clinic specialist.
+{reason_spoken} Main aapki madad karunga. Kya aap mujhe batayenge ki
+aap kahan hain — kaun sa sheher ya state?"
 """
 
 
@@ -345,6 +396,30 @@ class Assistant(Agent):
         logger.info("forget_me(%s) deleted=%s", user_id, deleted)
         return "Deleted." if deleted else "No record found."
 
+    @function_tool()
+    async def transfer_to_clinic_specialist(
+        self,
+        context: RunContext,
+        reason: Annotated[str, "Why the caller needs the clinic specialist, e.g. 'wants to know what to bring to OPD' or 'asking about PMJAY card usage'"],
+        health_concern: Annotated[str, "Brief summary of the caller's health concern so the specialist has context"],
+        caller_name: Annotated[str | None, "Caller's first name if known"] = None,
+        location: Annotated[str | None, "State or city the caller mentioned, if any"] = None,
+    ) -> str:
+        """Hand off to the clinic specialist when the caller asks about: OPD visits, clinic appointments,
+        what documents to bring to a hospital, how to use their Ayushman/PMJAY card at a facility,
+        OPD timings, referral process, or Jan Aushadhi stores. Do NOT use for symptom triage."""
+        logger.info("Aarogya → handoff to ClinicSpecialist reason=%r", reason)
+        specialist = ClinicSpecialist(
+            session=self._session,
+            main_agent=self,
+            caller_name=caller_name or "",
+            location=location or "",
+            health_concern=health_concern,
+            reason=reason,
+        )
+        self._session.update_agent(specialist)
+        return "Connecting you to Sahayak, our clinic specialist."
+
     # ── voice switching ───────────────────────────────────────────────────────
     def _record_call_end(self, failure_type: str | None = None) -> None:
         ended_at = datetime.now(timezone.utc).isoformat()
@@ -428,6 +503,53 @@ class Assistant(Agent):
             self._record_call_end(failure_type="user_silence_hangup")
         except asyncio.CancelledError:
             pass
+
+
+# ── Clinic Specialist agent ────────────────────────────────────────────────────
+class ClinicSpecialist(Agent):
+    """Specialist for clinic visits, OPD, documents, PMJAY card usage."""
+
+    def __init__(
+        self,
+        session: AgentSession,
+        main_agent: "Assistant",
+        caller_name: str,
+        location: str,
+        health_concern: str,
+        reason: str,
+    ) -> None:
+        name_part = f" {caller_name}" if caller_name else ""
+        reason_spoken = f"Aarogya ne bataya ki aapko {reason} mein madad chahiye."
+        instructions = CLINIC_SPECIALIST_PROMPT.format(
+            reason=reason,
+            caller_name=caller_name or "unknown",
+            location=location or "not specified",
+            health_concern=health_concern or "not specified",
+            name_part=name_part,
+            reason_spoken=reason_spoken,
+        )
+        super().__init__(instructions=instructions)
+        self._session    = session
+        self._main_agent = main_agent
+
+    @function_tool()
+    async def find_health_facility(
+        self,
+        context: RunContext,
+        state: Annotated[str, "Indian state name"],
+        city: Annotated[str | None, "City or district, optional"] = None,
+    ) -> dict:
+        """Find nearby government hospitals, PHCs, or CHCs."""
+        result = await find_health_facility(state, city)
+        self._main_agent._facility_given = True
+        return result
+
+    @function_tool()
+    async def transfer_back_to_aarogya(self, context: RunContext) -> str:
+        """Transfer the caller back to Aarogya for symptom triage, health advice, or any non-clinic question."""
+        logger.info("specialist → handoff back to Aarogya")
+        self._session.update_agent(self._main_agent)
+        return "Transferring you back to Aarogya now."
 
 
 # ── Outbound agent ────────────────────────────────────────────────────────────
